@@ -82,16 +82,18 @@ fn main() -> Result<()> {
     // Initialise with default settings
     mpu9250.init().unwrap();
 
-    // Probe the temperature
     loop {
         let temp = mpu9250.get_temperature_celsius().unwrap();
+        let accel = mpu9250.get_accel().unwrap();
+        let gyro = mpu9250.get_gyro().unwrap();
         let mag = mpu9250.get_mag().unwrap();
-        println!("Temp: {} °C, mag: {},{},{}", temp, mag.x, mag.y, mag.z);
-
         let pres = bmp.pressure();
-        println!("{}\t{}", pres, bmp.temp());
+        print!("T: {:.1} C, pres: {:.2} hPa", temp, pres / 100.0);
+        print!(", accel: ({:.3},{:.3},{:.3})", accel.x, accel.y, accel.z);
+        print!(", gryo: ({:.3},{:.3},{:.3})", gyro.x, gyro.y, gyro.z); 
+        println!(", mag: ({:.3},{:.3},{:.3})", mag.x, mag.y, mag.z);
 
-        thread::sleep(Duration::from_millis(50));
+        thread::sleep(Duration::from_millis(5));
     }
 }
 
