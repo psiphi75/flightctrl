@@ -6,10 +6,13 @@ mod bmp280;
 use std::{cell::RefCell, thread, time::*};
 
 use embedded_svc::httpd::*;
+use embedded_svc::sys_time::SystemTime;
 use esp_idf_hal::delay;
 use esp_idf_hal::i2c;
 use esp_idf_hal::prelude::*;
 
+use esp_idf_svc::systime::EspSystemTime;
+use mpu9250::vector::Vector;
 // use bmp280;
 use mpu9250::{calibration::Calibration, Mpu9250};
 use mpu9250_i2c as mpu9250;
@@ -44,8 +47,7 @@ fn main() -> Result<()> {
     let scl = peripherals.pins.gpio17;
 
     let config = <i2c::config::MasterConfig as Default>::default().baudrate(400.kHz().into());
-    let i2c0 =
-        i2c::Master::<i2c::I2C0, _, _>::new(i2c, i2c::MasterPins { sda: sda, scl: scl }, config)?;
+    let i2c0 = i2c::Master::<i2c::I2C0, _, _>::new(i2c, i2c::MasterPins { sda, scl }, config)?;
 
     // Set the calibration to the default setting.  This can
     // be set to a custom value specific for the device.
@@ -59,86 +61,133 @@ fn main() -> Result<()> {
     let sda = peripherals.pins.gpio21;
     let scl = peripherals.pins.gpio22;
     let config = <i2c::config::MasterConfig as Default>::default().baudrate(400.kHz().into());
-    let i2c1 =
-        i2c::Master::<i2c::I2C1, _, _>::new(i2c, i2c::MasterPins { sda: sda, scl: scl }, config)?;
+    let i2c1 = i2c::Master::<i2c::I2C1, _, _>::new(i2c, i2c::MasterPins { sda, scl }, config)?;
 
     // to create sensor with default configuration:
     let mut bmp = bmp280::BMP280::new(i2c1, BMP280_ADDRESS)?;
     println!("id={:?}", bmp.id());
 
-    let control = bmp280::Control {
-        osrs_t: bmp280::Oversampling::x16,
-        osrs_p: bmp280::Oversampling::x16,
-        mode: bmp280::PowerMode::Normal,
-    };
-    bmp.set_control(control);
-
+    // These BMP280 config and control settings ensure the most frequent
+    // updates, but it requires us to filter it afterwards.
+    //
+    // The following values give an udpate rate of 125 Hz:
+    //   config->t_sb    <== Standby::ms0_5
+    //   config->filter  <== Filter::off
+    //   control->osrs_t <== Oversampling::x1
+    //   control->osrs_p <== Oversampling::x2
+    //   control->mode   <== PowerMode::Normal
+    //
     let config = bmp280::Config {
-        t_sb: bmp280::Standby::ms0_5, // OFF
+        t_sb: bmp280::Standby::ms0_5,
         filter: bmp280::Filter::off,
     };
     bmp.set_config(config);
 
+    let control = bmp280::Control {
+        osrs_t: bmp280::Oversampling::x1, // Temperature oversampling
+        osrs_p: bmp280::Oversampling::x2, // Pressure oversampling
+        mode: bmp280::PowerMode::Normal,
+    };
+    bmp.set_control(control);
+
     // Initialise with default settings
     mpu9250.init().unwrap();
 
-    loop {
-        let temp = mpu9250.get_temperature_celsius().unwrap();
-        let accel = mpu9250.get_accel().unwrap();
-        let gyro = mpu9250.get_gyro().unwrap();
-        let mag = mpu9250.get_mag().unwrap();
-        let pres = bmp.pressure();
-        print!("T: {:.1} C, pres: {:.2} hPa", temp, pres / 100.0);
-        print!(", accel: ({:.3},{:.3},{:.3})", accel.x, accel.y, accel.z);
-        print!(", gryo: ({:.3},{:.3},{:.3})", gyro.x, gyro.y, gyro.z); 
-        println!(", mag: ({:.3},{:.3},{:.3})", mag.x, mag.y, mag.z);
+    // bmp280 Timings
+    const BMP280_UPDATE_MS: u32 = 1000 / 125;
+    let mut bmp280_last_read_time = 0;
 
-        thread::sleep(Duration::from_millis(5));
+    // Accel and gyro timing
+    const IMU_GA_UPDATE_MS: u32 = 1000 / 250;
+    let mut imu_ga_last_read_time = 1; // Interleave with bmp280 reading
+
+    // Accel and gyro timing
+    const IMU_M_UPDATE_MS: u32 = 1000 / 100;
+    let mut imu_m_last_read_time = 2;
+
+    let mut pres = 0.0;
+    let mut temp = 0.0;
+    let mut accel = Vector {
+        x: 0.0,
+        y: 0.0,
+        z: 0.0,
+    };
+    let mut gyro = Vector {
+        x: 0.0,
+        y: 0.0,
+        z: 0.0,
+    };
+    let mut mag = Vector {
+        x: 0.0,
+        y: 0.0,
+        z: 0.0,
+    };
+
+    let mut count = 0;
+
+    loop {
+        let now_ms = EspSystemTime {}.now().as_millis() as u32;
+
+        let bmp280_do_read = (now_ms - bmp280_last_read_time) >= BMP280_UPDATE_MS;
+        let imu_ga_do_read = (now_ms - imu_ga_last_read_time) >= IMU_GA_UPDATE_MS;
+        let imu_m_do_read = (now_ms - imu_m_last_read_time) >= IMU_M_UPDATE_MS;
+        let did_read = bmp280_do_read || imu_ga_do_read || imu_m_do_read;
+
+        if bmp280_do_read {
+            bmp280_last_read_time = now_ms;
+            pres = match bmp.pressure() {
+                Ok(r) => r,
+                Err(e) => {
+                    println!("Error reading pressure: {:?}", e);
+                    pres
+                }
+            };
+            temp = match bmp.temp() {
+                Ok(r) => r,
+                Err(e) => {
+                    println!("Error reading temperature: {:?}", e);
+                    temp
+                }
+            };
+        }
+
+        if imu_ga_do_read {
+            imu_ga_last_read_time = now_ms;
+            (accel, gyro) = match mpu9250.get_accel_gyro() {
+                Ok(r) => r,
+                Err(e) => {
+                    println!("Error reading accel and gyro: {:?}", e);
+                    (accel, gyro)
+                }
+            };
+        }
+
+        if imu_m_do_read {
+            imu_m_last_read_time = now_ms;
+            mag = match mpu9250.get_mag() {
+                Ok(r) => r,
+                Err(e) => {
+                    println!("Error reading magnetometer: {:?}", e);
+                    mag
+                }
+            };
+        }
+
+        count += 1;
+        if imu_m_do_read && (count % 37 == 0) {
+            print!(
+                "{}: T: {:.1} C, pres: {:.2} hPa",
+                now_ms,
+                temp,
+                pres / 100.0
+            );
+            print!(", accel: ({:.3},{:.3},{:.3})", accel.x, accel.y, accel.z);
+            print!(", gryo: ({:.3},{:.3},{:.3})", gyro.x, gyro.y, gyro.z);
+            println!(", mag: ({:.3},{:.3},{:.3})", mag.x, mag.y, mag.z);
+        }
+
+        if !did_read {
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 }
-
-// fn test_threads() {
-//     let mut children = vec![];
-
-//     println!("Rust main thread: {:?}", thread::current());
-
-//     TLS.with(|tls| {
-//         println!("Main TLS before change: {}", *tls.borrow());
-//     });
-
-//     TLS.with(|tls| *tls.borrow_mut() = 42);
-
-//     TLS.with(|tls| {
-//         println!("Main TLS after change: {}", *tls.borrow());
-//     });
-
-//     for i in 0..5 {
-//         // Spin up another thread
-//         children.push(thread::spawn(move || {
-//             println!("This is thread number {}, {:?}", i, thread::current());
-
-//             TLS.with(|tls| *tls.borrow_mut() = i);
-
-//             TLS.with(|tls| {
-//                 println!("Inner TLS: {}", *tls.borrow());
-//             });
-//         }));
-//     }
-
-//     println!(
-//         "About to join the threads. If ESP-IDF was patched successfully, joining will NOT crash"
-//     );
-
-//     for child in children {
-//         // Wait for the thread to finish. Returns a result.
-//         let _ = child.join();
-//     }
-
-//     TLS.with(|tls| {
-//         println!("Main TLS after threads: {}", *tls.borrow());
-//     });
-
-//     thread::sleep(Duration::from_secs(2));
-
-//     println!("Joins were successful.");
-// }

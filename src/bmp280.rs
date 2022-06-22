@@ -93,11 +93,11 @@ impl<I2C: ehal::blocking::i2c::WriteRead> BMP280<I2C> {
     }
 
     /// Reads and returns pressure
-    pub fn pressure(&mut self) -> f32 {
+    pub fn pressure(&mut self) -> Result<f32, <I2C as ehal::blocking::i2c::WriteRead>::Error> {
         let mut data: [u8; 6] = [0, 0, 0, 0, 0, 0];
         let _ = self
             .com
-            .write_read(self.addr, &[Register::press as u8], &mut data);
+            .write_read(self.addr, &[Register::press as u8], &mut data)?;
         let press = (data[0] as u32) << 12 | (data[1] as u32) << 4 | (data[2] as u32) >> 4;
 
         let mut var1 = ((self.t_fine as f32) / 2.0) - 64000.0;
@@ -114,27 +114,29 @@ impl<I2C: ehal::blocking::i2c::WriteRead> BMP280<I2C> {
             var2 = pressure * (self.dig_p8 as f32) / 32768.0;
             pressure += (var1 + var2 + (self.dig_p7 as f32)) / 16.0;
         }
-        pressure
+        Ok(pressure)
     }
 
     /// Reads and returns pressure and resets con
-    pub fn pressure_one_shot(&mut self) -> f32 {
-        let pressure = self.pressure();
+    pub fn pressure_one_shot(
+        &mut self,
+    ) -> Result<f32, <I2C as ehal::blocking::i2c::WriteRead>::Error> {
+        let pressure = self.pressure()?;
         self.set_control(Control {
             osrs_t: Oversampling::x2,
             osrs_p: Oversampling::x16,
             mode: PowerMode::Forced,
         });
 
-        pressure
+        Ok(pressure)
     }
 
     /// Reads and returns temperature
-    pub fn temp(&mut self) -> f32 {
+    pub fn temp(&mut self) -> Result<f32, <I2C as ehal::blocking::i2c::WriteRead>::Error> {
         let mut data: [u8; 6] = [0, 0, 0, 0, 0, 0];
         let _ = self
             .com
-            .write_read(self.addr, &[Register::press as u8], &mut data);
+            .write_read(self.addr, &[Register::press as u8], &mut data)?;
         let _pres = (data[0] as u32) << 12 | (data[1] as u32) << 4 | (data[2] as u32) >> 4;
         let temp = (data[3] as u32) << 12 | (data[4] as u32) << 4 | (data[5] as u32) >> 4;
 
@@ -144,7 +146,8 @@ impl<I2C: ehal::blocking::i2c::WriteRead> BMP280<I2C> {
             * (self.dig_t3 as f32);
         self.t_fine = (v1 + v2) as i32;
 
-        (v1 + v2) / 5120.0
+        let t = (v1 + v2) / 5120.0;
+        Ok(t)
     }
 
     /// Returns current config
